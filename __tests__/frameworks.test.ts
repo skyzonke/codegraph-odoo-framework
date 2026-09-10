@@ -221,6 +221,185 @@ async def create_article():
   });
 });
 
+import { odooResolver } from '../src/resolution/frameworks/odoo';
+import { generateNodeId } from '../src/extraction/tree-sitter-helpers';
+
+describe('odooResolver.extract', () => {
+  it('extracts an extends reference from a pure _inherit (monkey-patch) class', () => {
+    const src = `
+from odoo import models, fields
+
+class SaleOrder(models.Model):
+    _inherit = 'sale.order'
+
+    x_priority = fields.Boolean()
+`;
+    const { references } = odooResolver.extract!('addons/x_sale/models/sale_order.py', src);
+    expect(references).toHaveLength(1);
+    expect(references[0]).toMatchObject({
+      referenceName: 'sale.order',
+      referenceKind: 'extends',
+      language: 'python',
+    });
+    expect(references[0]!.fromNodeId).toBe(
+      generateNodeId('addons/x_sale/models/sale_order.py', 'class', 'SaleOrder', 4)
+    );
+  });
+
+  it('extracts a reference for a creator class that also inherits a mixin', () => {
+    const src = `
+class SaleOrder(models.Model):
+    _name = 'sale.order'
+    _inherit = ['mail.thread', 'mail.activity.mixin']
+    _description = 'Sales Order'
+`;
+    const { references } = odooResolver.extract!('sale/models/sale_order.py', src);
+    expect(references.map((r) => r.referenceName)).toEqual(['mail.thread', 'mail.activity.mixin']);
+  });
+
+  it('ignores non-Odoo classes', () => {
+    const src = `
+class Helper:
+    _inherit = 'sale.order'
+`;
+    const { references } = odooResolver.extract!('utils.py', src);
+    expect(references).toHaveLength(0);
+  });
+
+  it('ignores non-python files', () => {
+    const { references } = odooResolver.extract!('views/sale_order.xml', '<odoo/>');
+    expect(references).toHaveLength(0);
+  });
+});
+
+describe('odooResolver.detect', () => {
+  it('detects a project containing a __manifest__.py', () => {
+    const context = { getAllFiles: () => ['sale/__manifest__.py', 'sale/models/sale_order.py'] } as any;
+    expect(odooResolver.detect(context)).toBe(true);
+  });
+
+  it('returns false without any Odoo manifest', () => {
+    const context = { getAllFiles: () => ['app.py', 'requirements.txt'] } as any;
+    expect(odooResolver.detect(context)).toBe(false);
+  });
+});
+
+describe('odooResolver.claimsReference', () => {
+  it('claims dotted lower_snake_case model names', () => {
+    expect(odooResolver.claimsReference?.('sale.order')).toBe(true);
+    expect(odooResolver.claimsReference?.('mail.activity.mixin')).toBe(true);
+  });
+
+  it('does not claim non-model-shaped names', () => {
+    expect(odooResolver.claimsReference?.('SaleOrder')).toBe(false);
+    expect(odooResolver.claimsReference?.('sale_order')).toBe(false);
+  });
+});
+
+describe('odooResolver.resolve', () => {
+  function makeContext(files: Record<string, string>): any {
+    return {
+      getAllFiles: () => Object.keys(files),
+      readFile: (p: string) => files[p] ?? null,
+      getNodesInFile: () => [],
+      getNodesByName: () => [],
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: (p: string) => p in files,
+      getProjectRoot: () => '/test',
+      getNodesByLowerName: () => [],
+      getImportMappings: () => [],
+    };
+  }
+
+  it('links an _inherit class to the model creator across files', () => {
+    const creatorSrc = `
+class SaleOrder(models.Model):
+    _name = 'sale.order'
+`;
+    const extenderSrc = `
+class SaleOrder(models.Model):
+    _inherit = 'sale.order'
+`;
+    const context = makeContext({
+      'sale/models/sale_order.py': creatorSrc,
+      'x_sale/models/sale_order.py': extenderSrc,
+    });
+
+    const ref: UnresolvedRef = {
+      fromNodeId: generateNodeId('x_sale/models/sale_order.py', 'class', 'SaleOrder', 2),
+      referenceName: 'sale.order',
+      referenceKind: 'extends',
+      line: 2,
+      column: 0,
+      filePath: 'x_sale/models/sale_order.py',
+      language: 'python',
+    };
+
+    const result = odooResolver.resolve!(ref, context);
+    expect(result?.resolvedBy).toBe('framework');
+    expect(result?.targetNodeId).toBe(generateNodeId('sale/models/sale_order.py', 'class', 'SaleOrder', 2));
+  });
+
+  it('falls back to another extender when no creator is indexed', () => {
+    // Simulates extending a core Odoo model whose source isn't part of the
+    // indexed project — only two third-party extenders are visible.
+    const firstExtender = `
+class ResPartnerA(models.Model):
+    _inherit = 'res.partner'
+`;
+    const secondExtender = `
+class ResPartnerB(models.Model):
+    _inherit = 'res.partner'
+`;
+    const context = makeContext({
+      'moduleA/models/partner.py': firstExtender,
+      'moduleB/models/partner.py': secondExtender,
+    });
+
+    const ref: UnresolvedRef = {
+      fromNodeId: generateNodeId('moduleB/models/partner.py', 'class', 'ResPartnerB', 2),
+      referenceName: 'res.partner',
+      referenceKind: 'extends',
+      line: 2,
+      column: 0,
+      filePath: 'moduleB/models/partner.py',
+      language: 'python',
+    };
+
+    const result = odooResolver.resolve!(ref, context);
+    expect(result?.targetNodeId).toBe(generateNodeId('moduleA/models/partner.py', 'class', 'ResPartnerA', 2));
+  });
+
+  it('returns null when the model is not indexed anywhere', () => {
+    const context = makeContext({});
+    const ref: UnresolvedRef = {
+      fromNodeId: 'class:deadbeef',
+      referenceName: 'unknown.model',
+      referenceKind: 'extends',
+      line: 1,
+      column: 0,
+      filePath: 'x.py',
+      language: 'python',
+    };
+    expect(odooResolver.resolve!(ref, context)).toBeNull();
+  });
+
+  it('ignores non-extends references', () => {
+    const context = makeContext({});
+    const ref: UnresolvedRef = {
+      fromNodeId: 'class:deadbeef',
+      referenceName: 'sale.order',
+      referenceKind: 'references',
+      line: 1,
+      column: 0,
+      filePath: 'x.py',
+      language: 'python',
+    };
+    expect(odooResolver.resolve!(ref, context)).toBeNull();
+  });
+});
+
 import { expressResolver } from '../src/resolution/frameworks/express';
 
 describe('expressResolver.extract', () => {
